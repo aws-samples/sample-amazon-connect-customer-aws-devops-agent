@@ -1,0 +1,1794 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  AWS DevOps Agent - Complete deployment with Agent Space, IAM roles, operator app,
+  AWS association, Amazon Connect call flow monitoring, CloudWatch alarms, dashboard,
+  and vended log delivery in us-east-1. Designed for quick deployment to reduce
+  troubleshooting time.
+  v2 changes: added DeliveryDestinationType (CWL) to the log delivery destination;
+  removed unused X-Ray tracing/managed policy and unused CloudWatch DescribeAlarms
+  IAM grant from the alarm forwarder Lambda.
+
+Parameters:
+  AgentSpaceName:
+    Type: String
+    Default: ProductionAgentSpace
+    Description: Name for the agent space
+  AgentSpaceDescription:
+    Type: String
+    Default: Production DevOps Agent space with full observability
+    Description: Description for the agent space
+  ChatRequestAlarmThreshold:
+    Type: Number
+    Default: 100
+    Description: Alarm threshold for consumed chat requests (per 5 min period)
+  InvestigationTimeAlarmThreshold:
+    Type: Number
+    Default: 3600
+    Description: Alarm threshold for investigation time in seconds (per 5 min period)
+  EvaluationTimeAlarmThreshold:
+    Type: Number
+    Default: 1800
+    Description: Alarm threshold for evaluation time in seconds (per 5 min period)
+  AlarmNotificationEmail:
+    Type: String
+    Description: Email address for CloudWatch alarm notifications
+    AllowedPattern: ^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$
+    ConstraintDescription: Must be a valid email address
+  LogRetentionDays:
+    Type: Number
+    Default: 30
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1096, 1827, 2192, 2557, 2922, 3288, 3653]
+    Description: Number of days to retain vended logs in CloudWatch Logs
+  ConnectInstanceId:
+    Type: String
+    Description: Amazon Connect instance ID (UUID format, e.g. aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee)
+    AllowedPattern: ^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$
+    ConstraintDescription: Must be a valid Amazon Connect instance ID in UUID format
+  ConnectFlowLogGroupName:
+    Type: String
+    Default: ''
+    Description: >
+      Name of the CloudWatch Logs group where Amazon Connect writes contact flow logs
+      (e.g. /aws/connect/your-instance-alias). When set, the template creates a metric
+      filter that counts flow error events across ALL flows and an alarm that triggers
+      DevOps Agent investigation. This is the recommended way to catch flow errors,
+      since it needs no flow name and covers every flow automatically. Requires flow
+      logging enabled on the instance and a Set logging behavior block in your flows.
+      Leave blank to skip the log-based flow-error detector.
+  FlowLogErrorThreshold:
+    Type: Number
+    Default: 0
+    Description: >
+      Alarm threshold for flow error events found in Connect flow logs (per 5 min
+      period); alerts when exceeded. Default 0 = alert on any flow error.
+  MonitoredContactFlowName:
+    Type: String
+    Default: ''
+    Description: >
+      Exact name of the contact flow to monitor for flow errors, fatal errors, and
+      non-dialable callbacks. Connect publishes these metrics per contact flow
+      (dimension ContactFlowName), so the alarm must target a specific flow by name.
+      Leave blank to skip creating these flow-level alarms.
+      NOTE: For flow errors, prefer ConnectFlowLogGroupName (log-based, all flows).
+      AVOID OVERLAP: if you set both this and ConnectFlowLogGroupName, a single flow
+      error will trip BOTH the per-flow ContactFlowErrors alarm and the log-based
+      Connect-FlowErrors-FromLogs alarm, triggering two investigations for one root
+      cause. Pick one approach for flow errors (the log-based detector is recommended).
+  MonitoredQueueName:
+    Type: String
+    Default: ''
+    Description: >
+      Exact name of the queue to monitor for capacity-exceeded errors and longest
+      wait time. Connect publishes these metrics per queue (dimension QueueName), so
+      the alarm must target a specific queue by name. Leave blank to skip creating
+      these queue-level alarms.
+  ContactFlowErrorThreshold:
+    Type: Number
+    Default: 5
+    Description: Alarm threshold for contact flow errors (per 5 min period)
+  ContactFlowFatalErrorThreshold:
+    Type: Number
+    Default: 1
+    Description: Alarm threshold for contact flow fatal errors (per 5 min period)
+  MissedCallsThreshold:
+    Type: Number
+    Default: 10
+    Description: Alarm threshold for missed calls (per 5 min period)
+  ThrottledCallsThreshold:
+    Type: Number
+    Default: 1
+    Description: Alarm threshold for throttled calls (per 5 min period)
+  ConcurrentCallsPercentThreshold:
+    Type: Number
+    Default: 80
+    Description: Alarm threshold for concurrent calls as percentage of quota (0-100)
+  QueueWaitTimeThreshold:
+    Type: Number
+    Default: 300
+    Description: Alarm threshold for longest queue wait time in seconds
+  EnvironmentTag:
+    Type: String
+    Default: production
+    AllowedValues: [production, staging, development]
+    Description: Environment tag applied to all resources
+  ConcurrentChatsPercentThreshold:
+    Type: Number
+    Default: 80
+    Description: Alarm threshold for concurrent active chats as percentage of quota (0-100)
+  ConcurrentTasksPercentThreshold:
+    Type: Number
+    Default: 80
+    Description: Alarm threshold for concurrent active tasks as percentage of quota (0-100)
+  ConcurrentEmailsPercentThreshold:
+    Type: Number
+    Default: 80
+    Description: Alarm threshold for concurrent active emails as percentage of quota (0-100)
+  ContactLensConcurrentRealTimeThreshold:
+    Type: Number
+    Default: 240
+    Description: >
+      Alarm threshold for Contact Lens concurrent real-time analytics sessions.
+      Default quota is 300; alarm at 240 (80%) gives early warning.
+  ContactLensConcurrentPostCallThreshold:
+    Type: Number
+    Default: 160
+    Description: >
+      Alarm threshold for Contact Lens concurrent post-call analytics jobs.
+      Default quota is 200; alarm at 160 (80%) gives early warning.
+  TopologyCompletionMinCount:
+    Type: Number
+    Default: 0
+    Description: >
+      Minimum expected topology completions per 24h period. Alarm triggers
+      when completions are at or below this value (default 0 = alert when none run).
+  MisconfiguredPhoneNumbersThreshold:
+    Type: Number
+    Default: 0
+    Description: Alarm threshold for misconfigured phone numbers (per 5 min period); alerts when exceeded
+  CallsBreachingQuotaThreshold:
+    Type: Number
+    Default: 0
+    Description: Alarm threshold for calls breaching the concurrency quota (per 5 min period); alerts when exceeded
+  PacketLossPercentThreshold:
+    Type: Number
+    Default: 5
+    Description: Alarm threshold for voice packet loss as a percentage (0-100)
+  CallRecordingUploadErrorThreshold:
+    Type: Number
+    Default: 0
+    Description: Alarm threshold for call recording upload errors (per 5 min period); alerts when exceeded
+  QueueCapacityExceededThreshold:
+    Type: Number
+    Default: 0
+    Description: Alarm threshold for queue capacity exceeded errors (per 5 min period); alerts when exceeded
+  ChatsBreachingQuotaThreshold:
+    Type: Number
+    Default: 0
+    Description: Alarm threshold for chats breaching the active-chat quota (per 5 min period); alerts when exceeded
+  TasksBreachingQuotaThreshold:
+    Type: Number
+    Default: 0
+    Description: Alarm threshold for tasks breaching the concurrency quota (per 5 min period); alerts when exceeded
+  CallBackNotDialableThreshold:
+    Type: Number
+    Default: 0
+    Description: Alarm threshold for non-dialable queued callbacks (per 5 min period); alerts when exceeded
+  WebhookDeliveryFailureThreshold:
+    Type: Number
+    Default: 0
+    Description: Alarm threshold for webhook delivery failures landing in the DLQ (per 5 min period); alerts when exceeded
+  AlarmForwarderErrorThreshold:
+    Type: Number
+    Default: 0
+    Description: Alarm threshold for alarm forwarder Lambda errors (per 5 min period); alerts when exceeded
+  AlarmForwarderThrottleThreshold:
+    Type: Number
+    Default: 0
+    Description: Alarm threshold for alarm forwarder Lambda throttles (per 5 min period); alerts when exceeded
+
+Conditions:
+  # Flow-level alarms (ContactFlowErrors, ContactFlowFatalErrors, CallBackNotDialableNumber)
+  # are only created when a contact flow name is supplied, because these metrics are
+  # published per flow (dimension ContactFlowName) and cannot be aggregated in an alarm.
+  HasMonitoredContactFlow: !Not [!Equals [!Ref MonitoredContactFlowName, '']]
+  # Queue-level alarms (QueueCapacityExceeded, LongestQueueWaitTime) are only created
+  # when a queue name is supplied, for the same reason (dimension QueueName).
+  HasMonitoredQueue: !Not [!Equals [!Ref MonitoredQueueName, '']]
+  # Log-based flow-error detector (metric filter + alarm) is only created when the
+  # Connect flow-logs log group name is supplied. This catches errors across ALL flows
+  # without needing individual flow names.
+  HasFlowLogGroup: !Not [!Equals [!Ref ConnectFlowLogGroupName, '']]
+
+Resources:
+  # ============================================================
+  # IAM Roles
+  # ============================================================
+
+  DevOpsAgentSpaceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - ${Prefix}-${StackId}
+        - Prefix: DevOpsAgent-Space
+          StackId: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
+      Tags:
+        - Key: Project
+          Value: DevOpsAgent
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: aidevops.amazonaws.com
+            Action: sts:AssumeRole
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:aidevops:${AWS::Region}:${AWS::AccountId}:agentspace/*
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AIDevOpsAgentAccessPolicy
+      Policies:
+        - PolicyName: AllowCreateServiceLinkedRoles
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: AllowCreateServiceLinkedRoles
+                Effect: Allow
+                Action:
+                  - iam:CreateServiceLinkedRole
+                Resource:
+                  - !Sub arn:aws:iam::${AWS::AccountId}:role/aws-service-role/resource-explorer-2.amazonaws.com/AWSServiceRoleForResourceExplorer
+
+  DevOpsOperatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - ${Prefix}-${StackId}
+        - Prefix: DevOpsAgent-Operator
+          StackId: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
+      Tags:
+        - Key: Project
+          Value: DevOpsAgent
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: aidevops.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+            Condition:
+              StringEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:aidevops:${AWS::Region}:${AWS::AccountId}:agentspace/*
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AIDevOpsOperatorAppAccessPolicy
+
+  # ============================================================
+  # Agent Space
+  # ============================================================
+
+  AgentSpace:
+    Type: AWS::DevOpsAgent::AgentSpace
+    DependsOn:
+      - DevOpsAgentSpaceRole
+      - DevOpsOperatorRole
+    Properties:
+      Name: !Ref AgentSpaceName
+      Description: !Ref AgentSpaceDescription
+      OperatorApp:
+        Iam:
+          OperatorAppRoleArn: !GetAtt DevOpsOperatorRole.Arn
+
+  # ============================================================
+  # AWS Account Association (Monitor)
+  # ============================================================
+
+  MonitorAssociation:
+    Type: AWS::DevOpsAgent::Association
+    Properties:
+      AgentSpaceId: !GetAtt AgentSpace.AgentSpaceId
+      ServiceId: aws
+      Configuration:
+        Aws:
+          AssumableRoleArn: !GetAtt DevOpsAgentSpaceRole.Arn
+          AccountId: !Ref AWS::AccountId
+          AccountType: monitor
+
+  # ============================================================
+  # SNS Topic for Alarm Notifications
+  # ============================================================
+
+  # Customer-managed KMS key for the alarm topic. The AWS-managed key
+  # (alias/aws/sns) cannot grant CloudWatch permission to use it, so alarm
+  # notifications to an SSE-encrypted topic fail with "CloudWatch Alarms does
+  # not have authorization to access the SNS topic encryption key." This CMK
+  # explicitly allows the CloudWatch service principal to use the key.
+  DevOpsAgentAlarmKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub CMK for the DevOps Agent alarm SNS topic (${AWS::StackName})
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccountAdmin
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: AllowCloudWatchAlarmsUseOfKey
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey*
+            Resource: '*'
+      Tags:
+        - Key: Project
+          Value: DevOpsAgent
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  DevOpsAgentAlarmKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/DevOpsAgent-Alarms-${AWS::StackName}
+      TargetKeyId: !Ref DevOpsAgentAlarmKey
+
+  DevOpsAgentAlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub DevOpsAgent-CloudWatch-Alarms-${AWS::StackName}
+      DisplayName: DevOps Agent Alarms
+      KmsMasterKeyId: !Ref DevOpsAgentAlarmKey
+      Tags:
+        - Key: Project
+          Value: DevOpsAgent
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  DevOpsAgentAlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      TopicArn: !Ref DevOpsAgentAlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlarmNotificationEmail
+
+  DevOpsAgentAlarmTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref DevOpsAgentAlarmTopic
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudWatchAlarms
+            Effect: Allow
+            Principal:
+              Service: cloudwatch.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref DevOpsAgentAlarmTopic
+            Condition:
+              ArnLike:
+                aws:SourceArn: !Sub arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:*
+          - Sid: DenyExternalPublish
+            Effect: Deny
+            Principal: '*'
+            Action: sns:Publish
+            Resource: !Ref DevOpsAgentAlarmTopic
+            Condition:
+              StringNotEquals:
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # ============================================================
+  # CloudWatch Alarms - DevOps Agent Vended Metrics
+  # ============================================================
+
+  ConsumedChatRequestsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: DevOpsAgent-HighChatRequestConsumption
+      AlarmDescription: >
+        Triggers when consumed chat requests exceed the threshold.
+        High consumption may indicate unexpected automation loops or
+        increased operational incidents requiring investigation.
+      Namespace: AWS/AIDevOps
+      MetricName: ConsumedChatRequests
+      Dimensions:
+        - Name: AgentSpaceUUID
+          Value: !GetAtt AgentSpace.AgentSpaceId
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref ChatRequestAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  ConsumedInvestigationTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: DevOpsAgent-HighInvestigationTime
+      AlarmDescription: >
+        Triggers when total investigation time exceeds the threshold.
+        Prolonged investigations may indicate complex incidents or
+        resource contention in the monitored environment.
+      Namespace: AWS/AIDevOps
+      MetricName: ConsumedInvestigationTime
+      Dimensions:
+        - Name: AgentSpaceUUID
+          Value: !GetAtt AgentSpace.AgentSpaceId
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref InvestigationTimeAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  ConsumedEvaluationTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: DevOpsAgent-HighEvaluationTime
+      AlarmDescription: >
+        Triggers when total evaluation time exceeds the threshold.
+        Elevated evaluation time may signal degraded performance or
+        an increase in proactive checks.
+      Namespace: AWS/AIDevOps
+      MetricName: ConsumedEvaluationTime
+      Dimensions:
+        - Name: AgentSpaceUUID
+          Value: !GetAtt AgentSpace.AgentSpaceId
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref EvaluationTimeAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  TopologyCompletionFailureAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: DevOpsAgent-NoTopologyCompletions
+      AlarmDescription: >
+        Triggers when no topology completions are recorded in 24 hours.
+        Topology refreshes run daily; absence may indicate a service
+        disruption or misconfigured association.
+      Namespace: AWS/AIDevOps
+      MetricName: TopologyCompletionCount
+      Dimensions:
+        - Name: AgentSpaceUUID
+          Value: !GetAtt AgentSpace.AgentSpaceId
+      Statistic: Sum
+      Period: 86400
+      EvaluationPeriods: 1
+      Threshold: !Ref TopologyCompletionMinCount
+      ComparisonOperator: LessThanOrEqualToThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  # ============================================================
+  # CloudWatch Alarms - Amazon Connect Call Flow Monitoring
+  # ============================================================
+
+  ConnectContactFlowErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasMonitoredContactFlow
+    Properties:
+      AlarmName: Connect-ContactFlowErrors
+      AlarmDescription: >
+        Triggers when error branch executions in the monitored contact flow exceed
+        threshold. Indicates callers are hitting error paths in IVR/routing flows,
+        causing poor customer experience and potential call drops.
+      Namespace: AWS/Connect
+      MetricName: ContactFlowErrors
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ConnectInstanceId
+        - Name: MetricGroup
+          Value: ContactFlow
+        - Name: ContactFlowName
+          Value: !Ref MonitoredContactFlowName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: !Ref ContactFlowErrorThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  ConnectContactFlowFatalErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasMonitoredContactFlow
+    Properties:
+      AlarmName: Connect-ContactFlowFatalErrors
+      AlarmDescription: >
+        Triggers when the monitored contact flow crashes due to system errors.
+        Fatal errors mean the flow could not execute at all — callers
+        are disconnected or stuck. Requires immediate investigation.
+      Namespace: AWS/Connect
+      MetricName: ContactFlowFatalErrors
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ConnectInstanceId
+        - Name: MetricGroup
+          Value: ContactFlow
+        - Name: ContactFlowName
+          Value: !Ref MonitoredContactFlowName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref ContactFlowFatalErrorThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  ConnectMisconfiguredPhoneNumbersAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Connect-MisconfiguredPhoneNumbers
+      AlarmDescription: >
+        Triggers when calls fail because a phone number is not associated
+        with any contact flow. Callers hear dead air or a disconnect.
+      Namespace: AWS/Connect
+      MetricName: MisconfiguredPhoneNumbers
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ConnectInstanceId
+        - Name: MetricGroup
+          Value: VoiceCalls
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref MisconfiguredPhoneNumbersThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  ConnectThrottledCallsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Connect-ThrottledCalls
+      AlarmDescription: >
+        Triggers when voice calls are rejected due to rate limiting.
+        Customers cannot reach the contact center during throttling events.
+      Namespace: AWS/Connect
+      MetricName: ThrottledCalls
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ConnectInstanceId
+        - Name: MetricGroup
+          Value: VoiceCalls
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref ThrottledCallsThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  ConnectCallsBreachingQuotaAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Connect-CallsBreachingConcurrencyQuota
+      AlarmDescription: >
+        Triggers when concurrent voice calls exceed the instance quota.
+        Excess calls are rejected — customers get busy signals or failures.
+      Namespace: AWS/Connect
+      MetricName: CallsBreachingConcurrencyQuota
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ConnectInstanceId
+        - Name: MetricGroup
+          Value: VoiceCalls
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref CallsBreachingQuotaThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  ConnectMissedCallsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Connect-HighMissedCalls
+      AlarmDescription: >
+        Triggers when missed calls (not answered within 20s) exceed threshold.
+        May indicate insufficient agent staffing or routing issues.
+      Namespace: AWS/Connect
+      MetricName: MissedCalls
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ConnectInstanceId
+        - Name: MetricGroup
+          Value: VoiceCalls
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref MissedCallsThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  ConnectConcurrentCallsPercentAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Connect-HighConcurrentCallsPercent
+      AlarmDescription: >
+        Triggers when concurrent calls reach the specified percentage of quota.
+        Early warning before calls start getting rejected.
+      Namespace: AWS/Connect
+      MetricName: ConcurrentCallsPercentage
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ConnectInstanceId
+        - Name: MetricGroup
+          Value: VoiceCalls
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: !Ref ConcurrentCallsPercentThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  ConnectCallRecordingUploadErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Connect-CallRecordingUploadErrors
+      AlarmDescription: >
+        Triggers when call recordings fail to upload to S3.
+        May indicate S3 bucket misconfiguration, permissions issues,
+        or storage problems affecting compliance recording.
+      Namespace: AWS/Connect
+      MetricName: CallRecordingUploadError
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ConnectInstanceId
+        - Name: MetricGroup
+          Value: CallRecordings
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref CallRecordingUploadErrorThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  ConnectQueueCapacityExceededAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasMonitoredQueue
+    Properties:
+      AlarmName: Connect-QueueCapacityExceeded
+      AlarmDescription: >
+        Triggers when calls are rejected because the monitored queue is full.
+        Callers cannot enter the queue and are disconnected.
+      Namespace: AWS/Connect
+      MetricName: QueueCapacityExceededError
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ConnectInstanceId
+        - Name: MetricGroup
+          Value: Queue
+        - Name: QueueName
+          Value: !Ref MonitoredQueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref QueueCapacityExceededThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  ConnectPacketLossAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Connect-HighPacketLoss
+      AlarmDescription: >
+        Triggers when voice packet loss exceeds 5%. Callers and agents
+        experience choppy audio, dropped words, or one-way audio.
+      Namespace: AWS/Connect
+      MetricName: ToInstancePacketLossRate
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ConnectInstanceId
+        - Name: Participant
+          Value: Agent
+        - Name: Type of Connection
+          Value: WebRTC
+        - Name: Stream Type
+          Value: Voice
+      Statistic: Average
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: !Ref PacketLossPercentThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  ConnectLongestQueueWaitTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasMonitoredQueue
+    Properties:
+      AlarmName: Connect-LongestQueueWaitTime
+      AlarmDescription: >
+        Triggers when the longest time a contact has been waiting in the monitored
+        queue exceeds the threshold. Indicates staffing shortages or routing issues
+        causing unacceptable customer wait times.
+      Namespace: AWS/Connect
+      MetricName: LongestQueueWaitTime
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ConnectInstanceId
+        - Name: MetricGroup
+          Value: Queue
+        - Name: QueueName
+          Value: !Ref MonitoredQueueName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: !Ref QueueWaitTimeThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  # ============================================================
+  # Log-based Flow-Error Detector (all flows, no flow name needed)
+  # ============================================================
+  # Amazon Connect flow logs write a JSON event per block execution. Error events
+  # carry a top-level "Results" field (e.g. a failed Lambda invoke, a non-dialable
+  # callback), while normal block events do not. This metric filter counts any log
+  # entry that has a Results field, emitting a single instance-level custom metric
+  # (Connect/FlowLogs -> FlowErrorCount) that aggregates errors across ALL flows.
+  # A plain alarm on that metric fires reliably and triggers DevOps Agent investigation.
+  # Verified filter pattern against live flow logs: matches only error events.
+
+  ConnectFlowErrorMetricFilter:
+    Type: AWS::Logs::MetricFilter
+    Condition: HasFlowLogGroup
+    Properties:
+      LogGroupName: !Ref ConnectFlowLogGroupName
+      FilterName: !Sub DevOpsAgent-ConnectFlowErrors-${AWS::StackName}
+      FilterPattern: '{ $.Results = "*" }'
+      MetricTransformations:
+        # No dimensions: emit a single aggregate series across ALL flows. This is what
+        # lets one plain alarm cover every flow. (Metric-filter dimension values can only
+        # come from JSON fields like $.ContactFlowName, which would split the metric per
+        # flow and re-introduce the exact problem the log-based approach avoids.)
+        - MetricName: FlowErrorCount
+          MetricNamespace: Connect/FlowLogs
+          MetricValue: '1'
+          DefaultValue: 0
+
+  ConnectFlowErrorsFromLogsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasFlowLogGroup
+    DependsOn: ConnectFlowErrorMetricFilter
+    Properties:
+      AlarmName: Connect-FlowErrors-FromLogs
+      AlarmDescription: >
+        Triggers when contact flow error events appear in the Connect flow logs,
+        across all flows. Sourced from a CloudWatch Logs metric filter (not the
+        per-flow AWS/Connect metric), so it catches errors from every flow without
+        needing individual flow names. Feeds DevOps Agent auto-investigation.
+      Namespace: Connect/FlowLogs
+      MetricName: FlowErrorCount
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref FlowLogErrorThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  # ============================================================
+  # CloudWatch Alarms - Amazon Connect Chat & Task Quota Monitoring
+  # ============================================================
+
+  ConnectChatsBreachingQuotaAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Connect-ChatsBreachingActiveChatQuota
+      AlarmDescription: >
+        Triggers when chat requests are rejected because concurrent active
+        chats exceed the instance quota. Customers cannot start new chat
+        sessions during this period.
+      Namespace: AWS/Connect
+      MetricName: ChatsBreachingActiveChatQuota
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ConnectInstanceId
+        - Name: MetricGroup
+          Value: Chats
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref ChatsBreachingQuotaThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  ConnectConcurrentChatsPercentAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Connect-HighConcurrentChatsPercent
+      AlarmDescription: >
+        Early warning when concurrent active chats approach the instance quota.
+        Allows time to request a quota increase before chats are rejected.
+      Namespace: AWS/Connect
+      MetricName: ConcurrentActiveChatsPercentage
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ConnectInstanceId
+        - Name: MetricGroup
+          Value: Chats
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: !Ref ConcurrentChatsPercentThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  ConnectTasksBreachingQuotaAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Connect-TasksBreachingConcurrencyQuota
+      AlarmDescription: >
+        Triggers when tasks are rejected because concurrent active tasks
+        exceed the instance quota. Task creation fails during this period.
+      Namespace: AWS/Connect
+      MetricName: TasksBreachingConcurrencyQuota
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ConnectInstanceId
+        - Name: MetricGroup
+          Value: Tasks
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref TasksBreachingQuotaThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  ConnectConcurrentTasksPercentAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Connect-HighConcurrentTasksPercent
+      AlarmDescription: >
+        Early warning when concurrent active tasks approach the instance quota.
+        Allows time to request a quota increase before tasks are rejected.
+      Namespace: AWS/Connect
+      MetricName: ConcurrentTasksPercentage
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ConnectInstanceId
+        - Name: MetricGroup
+          Value: Tasks
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref ConcurrentTasksPercentThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  ConnectConcurrentEmailsPercentAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Connect-HighConcurrentEmailsPercent
+      AlarmDescription: >
+        Early warning when concurrent active emails approach the instance quota.
+        Allows time to request a quota increase before email handling fails.
+      Namespace: AWS/Connect
+      MetricName: ConcurrentEmailsPercentage
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ConnectInstanceId
+        - Name: MetricGroup
+          Value: Email
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: !Ref ConcurrentEmailsPercentThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  # NOTE: Connect-TasksExpired alarm intentionally omitted.
+  # The TasksExpired metric is published only per contact (dimension ContactId),
+  # which is not known ahead of time, and CloudWatch alarms cannot aggregate across
+  # a dimension (SEARCH is not supported on alarms). There is no instance-level
+  # rollup to alarm on, so a reliable preconfigured alarm is not possible for this
+  # metric. Monitor TasksExpired via the dashboard or a scheduled metric-math query.
+
+  ConnectCallBackNotDialableAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Condition: HasMonitoredContactFlow
+    Properties:
+      AlarmName: Connect-CallBackNotDialableNumber
+      AlarmDescription: >
+        Triggers when queued callbacks in the monitored contact flow cannot be
+        dialed because the customer number is in a country not allowed for the
+        instance. Indicates outbound dialing configuration issues.
+      Namespace: AWS/Connect
+      MetricName: CallBackNotDialableNumber
+      Dimensions:
+        - Name: InstanceId
+          Value: !Ref ConnectInstanceId
+        - Name: MetricGroup
+          Value: ContactFlow
+        - Name: ContactFlowName
+          Value: !Ref MonitoredContactFlowName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref CallBackNotDialableThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  # ============================================================
+  # CloudWatch Alarms - Contact Lens Quota Monitoring
+  # ============================================================
+
+  ContactLensConcurrentRealTimeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Connect-ContactLens-HighConcurrentRealTimeAnalytics
+      AlarmDescription: >
+        Triggers when concurrent real-time Contact Lens analytics sessions
+        approach the quota (default 300). When exceeded, new calls will not
+        get real-time analytics. Uses AWS/Usage namespace with Service Quotas
+        integration for Contact Lens.
+      Namespace: AWS/Usage
+      MetricName: ResourceCount
+      Dimensions:
+        - Name: Service
+          Value: Connect
+        - Name: Type
+          Value: Resource
+        - Name: Resource
+          Value: ConcurrentRealTimeCallsWithAnalytics
+        - Name: Class
+          Value: None
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: !Ref ContactLensConcurrentRealTimeThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  ContactLensConcurrentPostCallAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Connect-ContactLens-HighConcurrentPostCallJobs
+      AlarmDescription: >
+        Triggers when concurrent post-call Contact Lens analytics jobs
+        approach the quota (default 200). When exceeded, post-call analysis
+        is delayed or dropped, impacting quality management workflows.
+      Namespace: AWS/Usage
+      MetricName: ResourceCount
+      Dimensions:
+        - Name: Service
+          Value: Connect
+        - Name: Type
+          Value: Resource
+        - Name: Resource
+          Value: ConcurrentPostCallAnalyticsJobs
+        - Name: Class
+          Value: None
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 5
+      Threshold: !Ref ContactLensConcurrentPostCallThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  # ============================================================
+  # Auto-Investigation: CloudWatch Alarm → Lambda → DevOps Agent Webhook
+  # DevOps Agent uses HMAC-authenticated webhooks for external triggers.
+  # The Lambda function receives alarm events and forwards them to the
+  # DevOps Agent webhook endpoint.
+  # ============================================================
+
+  WebhookSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Sub DevOpsAgent-WebhookSecret-${AWS::StackName}
+      Description: >
+        Stores the DevOps Agent webhook URL and HMAC secret.
+        After stack creation, update this secret with the values from
+        your DevOps Agent webhook configuration.
+      KmsKeyId: alias/aws/secretsmanager
+      SecretString: !Sub |
+        {
+          "WEBHOOK_URL": "REPLACE_WITH_WEBHOOK_URL",
+          "WEBHOOK_SECRET": "REPLACE_WITH_WEBHOOK_SECRET"
+        }
+      Tags:
+        - Key: Project
+          Value: DevOpsAgent
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  AlarmForwarderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub
+        - ${Prefix}-${StackId}
+        - Prefix: DevOpsAgent-Forwarder
+          StackId: !Select [2, !Split ['/', !Ref 'AWS::StackId']]
+      Tags:
+        - Key: Project
+          Value: DevOpsAgent
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: ReadWebhookSecret
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref WebhookSecret
+        - PolicyName: SendToDLQ
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:SendMessage
+                Resource: !GetAtt AlarmForwarderDLQ.Arn
+
+  # ============================================================
+  # Dead Letter Queue for Lambda Forwarder
+  # ============================================================
+
+  AlarmForwarderDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub DevOpsAgent-AlarmForwarder-DLQ-${AWS::StackName}
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+      Tags:
+        - Key: Project
+          Value: DevOpsAgent
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  AlarmForwarderDLQPolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      Queues:
+        - !Ref AlarmForwarderDLQ
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowEventBridgeSendMessage
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt AlarmForwarderDLQ.Arn
+            Condition:
+              ArnEquals:
+                aws:SourceArn: !GetAtt ConnectAlarmEventRule.Arn
+
+  AlarmForwarderDLQAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Infra-WebhookDeliveryFailures
+      AlarmDescription: >
+        Triggers when messages land in the dead letter queue, indicating
+        the Lambda forwarder failed to deliver alarm events to the DevOps
+        Agent webhook. Check webhook configuration and endpoint availability.
+        NOTE: This alarm intentionally does NOT use the Connect- or DevOpsAgent-
+        prefix to avoid circular auto-investigation triggers.
+      Namespace: AWS/SQS
+      MetricName: ApproximateNumberOfMessagesVisible
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt AlarmForwarderDLQ.QueueName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref WebhookDeliveryFailureThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  AlarmForwarderErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Infra-AlarmForwarderErrors
+      AlarmDescription: >
+        Triggers when the alarm forwarder Lambda function encounters errors.
+        Indicates webhook delivery issues, Secrets Manager access problems,
+        or code exceptions. Check Lambda CloudWatch Logs for details.
+        NOTE: Uses Infra- prefix to avoid circular auto-investigation.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AlarmForwarderFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref AlarmForwarderErrorThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  AlarmForwarderThrottlesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: Infra-AlarmForwarderThrottles
+      AlarmDescription: >
+        Triggers when the alarm forwarder Lambda function is being throttled.
+        May indicate an alarm storm exceeding the reserved concurrency limit.
+        Consider increasing ReservedConcurrentExecutions if legitimate.
+        NOTE: Uses Infra- prefix to avoid circular auto-investigation.
+      Namespace: AWS/Lambda
+      MetricName: Throttles
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AlarmForwarderFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: !Ref AlarmForwarderThrottleThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref DevOpsAgentAlarmTopic
+      OKActions:
+        - !Ref DevOpsAgentAlarmTopic
+
+  AlarmForwarderFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub DevOpsAgent-AlarmForwarder-${AWS::StackName}
+      Description: >
+        Forwards CloudWatch Alarm events to DevOps Agent via HMAC webhook
+        to trigger autonomous investigations for Connect and DevOps Agent issues.
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 30
+      MemorySize: 128
+      ReservedConcurrentExecutions: 10
+      Role: !GetAtt AlarmForwarderRole.Arn
+      DeadLetterConfig:
+        TargetArn: !GetAtt AlarmForwarderDLQ.Arn
+      Tags:
+        - Key: Project
+          Value: DevOpsAgent
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+      Environment:
+        Variables:
+          SECRET_ARN: !Ref WebhookSecret
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import hmac
+          import hashlib
+          import base64
+          import logging
+          import urllib3
+          import boto3
+          from datetime import datetime, timezone
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          http = urllib3.PoolManager()
+          secrets_client = boto3.client('secretsmanager')
+
+          # Module-level cache for webhook config (persists across warm invocations)
+          _cached_config = None
+
+          def get_webhook_config():
+              global _cached_config
+              if _cached_config is not None:
+                  return _cached_config
+              secret_arn = os.environ['SECRET_ARN']
+              response = secrets_client.get_secret_value(SecretId=secret_arn)
+              _cached_config = json.loads(response['SecretString'])
+              return _cached_config
+
+          def lambda_handler(event, context):
+              logger.info("Received alarm event for: %s",
+                         event.get('detail', {}).get('alarmName', 'Unknown'))
+
+              try:
+                  config = get_webhook_config()
+              except Exception as e:
+                  logger.error("Failed to retrieve webhook secret: %s", str(e))
+                  raise
+
+              webhook_url = config['WEBHOOK_URL']
+              webhook_secret = config['WEBHOOK_SECRET']
+
+              if webhook_url == 'REPLACE_WITH_WEBHOOK_URL':
+                  logger.warning("Webhook not configured yet. Update the Secrets Manager secret.")
+                  return {'statusCode': 200, 'body': 'Webhook not configured'}
+
+              # Parse EventBridge CloudWatch Alarm State Change event
+              if 'detail' not in event:
+                  logger.error("Unrecognized event format - expected EventBridge envelope")
+                  return {'statusCode': 400, 'body': 'Unrecognized event'}
+
+              detail = event['detail']
+              alarm_name = detail.get('alarmName', 'Unknown')
+              new_state = detail.get('state', {}).get('value', 'ALARM')
+              reason = detail.get('state', {}).get('reason', '')
+              timestamp = detail.get('state', {}).get('timestamp',
+                         datetime.now(timezone.utc).isoformat())
+              alarm_desc = detail.get('configuration', {}).get('description', '')
+              region = event.get('region', 'us-east-1')
+              account_id = event.get('account', '')
+
+              if new_state != 'ALARM':
+                  logger.info("State is %s for %s, skipping", new_state, alarm_name)
+                  return {'statusCode': 200, 'body': f'State is {new_state}, skipping'}
+
+              description = f"CloudWatch Alarm: {alarm_name}\n"
+              description += f"Account: {account_id}\nRegion: {region}\n"
+              description += f"State: {new_state}\nReason: {reason}"
+              if alarm_desc:
+                  description += f"\nDescription: {alarm_desc}"
+
+              payload = {
+                  "eventType": "incident",
+                  "incidentId": f"{alarm_name}-{timestamp}",
+                  "action": "created",
+                  "priority": "HIGH",
+                  "title": f"CloudWatch Alarm: {alarm_name}",
+                  "description": description,
+                  "timestamp": timestamp,
+                  "service": alarm_name
+              }
+
+              payload_json = json.dumps(payload)
+              event_timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.000Z')
+              signature_string = f"{event_timestamp}:{payload_json}"
+              signature = hmac.new(
+                  webhook_secret.encode('utf-8'),
+                  signature_string.encode('utf-8'),
+                  hashlib.sha256
+              ).digest()
+              signature_b64 = base64.b64encode(signature).decode('utf-8')
+
+              headers = {
+                  'Content-Type': 'application/json',
+                  'x-amzn-event-timestamp': event_timestamp,
+                  'x-amzn-event-signature': signature_b64
+              }
+
+              try:
+                  response = http.request('POST', webhook_url, body=payload_json,
+                                          headers=headers, timeout=10.0)
+              except Exception as e:
+                  logger.error("Webhook request failed for %s: %s", alarm_name, str(e))
+                  raise
+
+              logger.info("Webhook response for %s: %d", alarm_name, response.status)
+
+              if response.status in [200, 202]:
+                  return {'statusCode': 200, 'body': 'Investigation triggered'}
+              else:
+                  raise Exception(
+                      f"Webhook failed for {alarm_name}: {response.status} - "
+                      f"{response.data.decode('utf-8', errors='replace')}"
+                  )
+
+  AlarmForwarderEventPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AlarmForwarderFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ConnectAlarmEventRule.Arn
+
+  ConnectAlarmEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub DevOpsAgent-AlarmTrigger-${AWS::StackName}
+      Description: >
+        Routes CloudWatch alarm state changes (Connect and DevOps Agent)
+        to the Lambda forwarder which triggers DevOps Agent investigations via webhook.
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.cloudwatch
+        detail-type:
+          - CloudWatch Alarm State Change
+        detail:
+          alarmName:
+            - prefix: Connect-
+            - prefix: DevOpsAgent-
+          state:
+            value:
+              - ALARM
+      Targets:
+        - Id: AlarmForwarderLambda
+          Arn: !GetAtt AlarmForwarderFunction.Arn
+          RetryPolicy:
+            MaximumRetryAttempts: 3
+            MaximumEventAgeInSeconds: 3600
+          DeadLetterConfig:
+            Arn: !GetAtt AlarmForwarderDLQ.Arn
+
+  # ============================================================
+  # CloudWatch Dashboard
+  # ============================================================
+
+  DevOpsAgentDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub DevOpsAgent-Observability-${AWS::StackName}
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0,
+              "y": 0,
+              "width": 24,
+              "height": 2,
+              "properties": {
+                "markdown": "# AWS DevOps Agent + Amazon Connect — Operational Dashboard\nAgent Space: **${AgentSpaceName}** | Connect Instance: **${ConnectInstanceId}** | Region: **${AWS::Region}**"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 2,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/AIDevOps", "ConsumedChatRequests", "AgentSpaceUUID", "${AgentSpace.AgentSpaceId}", {"stat": "Sum", "label": "Chat Requests"}]
+                ],
+                "title": "DevOps Agent - Chat Requests",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "view": "timeSeries",
+                "stacked": false,
+                "yAxis": {"left": {"min": 0}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 2,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/AIDevOps", "ConsumedInvestigationTime", "AgentSpaceUUID", "${AgentSpace.AgentSpaceId}", {"stat": "Sum", "label": "Total (s)"}],
+                  ["AWS/AIDevOps", "ConsumedInvestigationTime", "AgentSpaceUUID", "${AgentSpace.AgentSpaceId}", {"stat": "Maximum", "label": "Max (s)"}]
+                ],
+                "title": "DevOps Agent - Investigation Time",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "view": "timeSeries",
+                "stacked": false,
+                "yAxis": {"left": {"min": 0, "label": "Seconds"}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 2,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/AIDevOps", "ConsumedEvaluationTime", "AgentSpaceUUID", "${AgentSpace.AgentSpaceId}", {"stat": "Sum", "label": "Total (s)"}],
+                  ["AWS/AIDevOps", "ConsumedEvaluationTime", "AgentSpaceUUID", "${AgentSpace.AgentSpaceId}", {"stat": "Maximum", "label": "Max (s)"}]
+                ],
+                "title": "DevOps Agent - Evaluation Time",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "view": "timeSeries",
+                "stacked": false,
+                "yAxis": {"left": {"min": 0, "label": "Seconds"}}
+              }
+            },
+            {
+              "type": "text",
+              "x": 0,
+              "y": 8,
+              "width": 24,
+              "height": 1,
+              "properties": {
+                "markdown": "## Amazon Connect — Call Flow Health"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 9,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["Connect/FlowLogs", "FlowErrorCount", {"stat": "Sum", "label": "Flow Errors (from logs, all flows)", "color": "#d13212"}],
+                  [{"expression": "SUM(SEARCH('{AWS/Connect,ContactFlowName,InstanceId,MetricGroup} MetricName=\"ContactFlowErrors\" InstanceId=\"${ConnectInstanceId}\" MetricGroup=\"ContactFlow\"', 'Sum', 300))", "label": "ContactFlowErrors metric (per-flow)", "id": "e1"}],
+                  [{"expression": "SUM(SEARCH('{AWS/Connect,ContactFlowName,InstanceId,MetricGroup} MetricName=\"ContactFlowFatalErrors\" InstanceId=\"${ConnectInstanceId}\" MetricGroup=\"ContactFlow\"', 'Sum', 300))", "label": "ContactFlowFatalErrors metric (per-flow)", "id": "e2"}]
+                ],
+                "title": "Contact Flow Errors",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "view": "timeSeries",
+                "stacked": false,
+                "yAxis": {"left": {"min": 0}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 9,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Connect", "ConcurrentCalls", "InstanceId", "${ConnectInstanceId}", "MetricGroup", "VoiceCalls", {"stat": "Maximum", "label": "Concurrent Calls"}],
+                  ["AWS/Connect", "CallsPerInterval", "InstanceId", "${ConnectInstanceId}", "MetricGroup", "VoiceCalls", {"stat": "Sum", "label": "Calls/Interval"}]
+                ],
+                "title": "Call Volume",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "view": "timeSeries",
+                "stacked": false,
+                "yAxis": {"left": {"min": 0}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 9,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Connect", "MissedCalls", "InstanceId", "${ConnectInstanceId}", "MetricGroup", "VoiceCalls", {"stat": "Sum", "label": "Missed Calls"}],
+                  ["AWS/Connect", "ThrottledCalls", "InstanceId", "${ConnectInstanceId}", "MetricGroup", "VoiceCalls", {"stat": "Sum", "label": "Throttled", "color": "#d13212"}]
+                ],
+                "title": "Missed & Throttled Calls",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "view": "timeSeries",
+                "stacked": false,
+                "yAxis": {"left": {"min": 0}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 15,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Connect", "CallsBreachingConcurrencyQuota", "InstanceId", "${ConnectInstanceId}", "MetricGroup", "VoiceCalls", {"stat": "Sum", "label": "Breaching Quota"}],
+                  ["AWS/Connect", "MisconfiguredPhoneNumbers", "InstanceId", "${ConnectInstanceId}", "MetricGroup", "VoiceCalls", {"stat": "Sum", "label": "Misconfigured Numbers"}]
+                ],
+                "title": "Quota Breaches & Misconfigurations",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "view": "timeSeries",
+                "stacked": false,
+                "yAxis": {"left": {"min": 0}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 15,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Connect", "ToInstancePacketLossRate", "InstanceId", "${ConnectInstanceId}", "Participant", "Agent", "Type of Connection", "WebRTC", "Stream Type", "Voice", {"stat": "Average", "label": "Avg Packet Loss %"}]
+                ],
+                "title": "Voice Quality - Packet Loss",
+                "region": "${AWS::Region}",
+                "period": 60,
+                "view": "timeSeries",
+                "stacked": false,
+                "yAxis": {"left": {"min": 0, "max": 100, "label": "%"}},
+                "annotations": {"horizontal": [{"value": 5, "label": "Threshold", "color": "#d13212"}]}
+              }
+            },
+            {
+              "type": "text",
+              "x": 0,
+              "y": 21,
+              "width": 24,
+              "height": 1,
+              "properties": {
+                "markdown": "## Quota Utilization — Voice, Chat, Tasks, Email & Contact Lens"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0,
+              "y": 22,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Connect", "ConcurrentCallsPercentage", "InstanceId", "${ConnectInstanceId}", "MetricGroup", "VoiceCalls", {"stat": "Maximum", "label": "Calls %"}],
+                  ["AWS/Connect", "ConcurrentActiveChatsPercentage", "InstanceId", "${ConnectInstanceId}", "MetricGroup", "Chats", {"stat": "Maximum", "label": "Chats %"}],
+                  ["AWS/Connect", "ConcurrentTasksPercentage", "InstanceId", "${ConnectInstanceId}", "MetricGroup", "Tasks", {"stat": "Maximum", "label": "Tasks %"}],
+                  ["AWS/Connect", "ConcurrentEmailsPercentage", "InstanceId", "${ConnectInstanceId}", "MetricGroup", "Email", {"stat": "Maximum", "label": "Emails %"}]
+                ],
+                "title": "Quota Utilization % (All Channels)",
+                "region": "${AWS::Region}",
+                "period": 60,
+                "view": "timeSeries",
+                "stacked": false,
+                "yAxis": {"left": {"min": 0, "max": 100, "label": "% of Quota"}},
+                "annotations": {"horizontal": [{"value": 80, "label": "Warning (80%)", "color": "#ff7f0e"}, {"value": 100, "label": "Quota Limit", "color": "#d13212"}]}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8,
+              "y": 22,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Connect", "CallsBreachingConcurrencyQuota", "InstanceId", "${ConnectInstanceId}", "MetricGroup", "VoiceCalls", {"stat": "Sum", "label": "Calls Breaching"}],
+                  ["AWS/Connect", "ChatsBreachingActiveChatQuota", "InstanceId", "${ConnectInstanceId}", "MetricGroup", "Chats", {"stat": "Sum", "label": "Chats Breaching"}],
+                  ["AWS/Connect", "TasksBreachingConcurrencyQuota", "InstanceId", "${ConnectInstanceId}", "MetricGroup", "Tasks", {"stat": "Sum", "label": "Tasks Breaching"}]
+                ],
+                "title": "Quota Breaches (Rejected Contacts)",
+                "region": "${AWS::Region}",
+                "period": 300,
+                "view": "timeSeries",
+                "stacked": true,
+                "yAxis": {"left": {"min": 0}}
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16,
+              "y": 22,
+              "width": 8,
+              "height": 6,
+              "properties": {
+                "metrics": [
+                  ["AWS/Usage", "ResourceCount", "Service", "Connect", "Type", "Resource", "Resource", "ConcurrentRealTimeCallsWithAnalytics", "Class", "None", {"stat": "Maximum", "label": "Real-Time Sessions"}],
+                  ["AWS/Usage", "ResourceCount", "Service", "Connect", "Type", "Resource", "Resource", "ConcurrentPostCallAnalyticsJobs", "Class", "None", {"stat": "Maximum", "label": "Post-Call Jobs"}]
+                ],
+                "title": "Contact Lens — Concurrent Analytics",
+                "region": "${AWS::Region}",
+                "period": 60,
+                "view": "timeSeries",
+                "stacked": false,
+                "yAxis": {"left": {"min": 0}},
+                "annotations": {"horizontal": [{"value": 300, "label": "Real-Time Quota", "color": "#d13212"}, {"value": 200, "label": "Post-Call Quota", "color": "#ff7f0e"}]}
+              }
+            },
+            {
+              "type": "alarm",
+              "x": 0,
+              "y": 28,
+              "width": 24,
+              "height": 4,
+              "properties": {
+                "title": "Always-On Alarm Status (optional flow/queue and log-based alarms appear on their own tiles when enabled)",
+                "alarms": [
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:DevOpsAgent-HighChatRequestConsumption",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:DevOpsAgent-HighInvestigationTime",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:DevOpsAgent-HighEvaluationTime",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:DevOpsAgent-NoTopologyCompletions",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:Connect-MisconfiguredPhoneNumbers",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:Connect-ThrottledCalls",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:Connect-CallsBreachingConcurrencyQuota",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:Connect-HighMissedCalls",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:Connect-HighConcurrentCallsPercent",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:Connect-CallRecordingUploadErrors",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:Connect-HighPacketLoss",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:Connect-ChatsBreachingActiveChatQuota",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:Connect-HighConcurrentChatsPercent",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:Connect-TasksBreachingConcurrencyQuota",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:Connect-HighConcurrentTasksPercent",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:Connect-HighConcurrentEmailsPercent",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:Connect-ContactLens-HighConcurrentRealTimeAnalytics",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:Connect-ContactLens-HighConcurrentPostCallJobs",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:Infra-WebhookDeliveryFailures",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:Infra-AlarmForwarderErrors",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:Infra-AlarmForwarderThrottles"
+                ]
+              }
+            }
+          ]
+        }
+
+  # ============================================================
+  # Vended Log Delivery (CloudWatch Logs)
+  # ============================================================
+
+  DevOpsAgentLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      LogGroupName: !Sub /aws/aidevops/${AWS::StackName}/agent-space-logs
+      RetentionInDays: !Ref LogRetentionDays
+      Tags:
+        - Key: Project
+          Value: DevOpsAgent
+        - Key: Environment
+          Value: !Ref EnvironmentTag
+
+  DevOpsAgentLogDeliverySource:
+    Type: AWS::Logs::DeliverySource
+    DependsOn: AgentSpace
+    Properties:
+      Name: devops-agent-space-source
+      ResourceArn: !GetAtt AgentSpace.Arn
+      LogType: APPLICATION_LOGS
+
+  DevOpsAgentLogDeliveryDestination:
+    Type: AWS::Logs::DeliveryDestination
+    Properties:
+      Name: devops-agent-space-destination
+      DeliveryDestinationType: CWL
+      DestinationResourceArn: !GetAtt DevOpsAgentLogGroup.Arn
+      OutputFormat: json
+
+  DevOpsAgentLogDelivery:
+    Type: AWS::Logs::Delivery
+    DependsOn:
+      - DevOpsAgentLogDeliverySource
+      - DevOpsAgentLogDeliveryDestination
+    Properties:
+      DeliverySourceName: devops-agent-space-source
+      DeliveryDestinationArn: !GetAtt DevOpsAgentLogDeliveryDestination.Arn
+
+# ============================================================
+# Outputs
+# ============================================================
+
+Outputs:
+  AgentSpaceId:
+    Description: The agent space ID
+    Value: !GetAtt AgentSpace.AgentSpaceId
+  AgentSpaceArn:
+    Description: The agent space ARN
+    Value: !GetAtt AgentSpace.Arn
+  AgentSpaceRoleArn:
+    Description: The agent space IAM role ARN
+    Value: !GetAtt DevOpsAgentSpaceRole.Arn
+  OperatorRoleArn:
+    Description: The operator app IAM role ARN
+    Value: !GetAtt DevOpsOperatorRole.Arn
+  AlarmTopicArn:
+    Description: SNS topic ARN for alarm notifications
+    Value: !Ref DevOpsAgentAlarmTopic
+  DashboardURL:
+    Description: Direct link to the CloudWatch dashboard
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home?region=${AWS::Region}#dashboards:name=DevOpsAgent-Observability-${AWS::StackName}
+  LogGroupName:
+    Description: CloudWatch Log Group for vended logs
+    Value: !Ref DevOpsAgentLogGroup
+  ConnectInstanceMonitored:
+    Description: Amazon Connect instance ID being monitored
+    Value: !Ref ConnectInstanceId
+  AlarmForwarderDLQUrl:
+    Description: Dead letter queue URL for failed webhook deliveries
+    Value: !Ref AlarmForwarderDLQ
+  AlarmForwarderDLQArn:
+    Description: Dead letter queue ARN for monitoring
+    Value: !GetAtt AlarmForwarderDLQ.Arn
