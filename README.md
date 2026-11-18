@@ -269,8 +269,6 @@ python3 cleanup_devops_agent_stack.py --stack-name devops-agent-stack           
 python3 cleanup_devops_agent_stack.py --stack-name devops-agent-stack --execute
 ```
 
-See [README-cleanup.md](README-cleanup.md) for details.
-
 ## Files
 
 | File | Purpose |
